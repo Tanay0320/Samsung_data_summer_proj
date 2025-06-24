@@ -1,3 +1,4 @@
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import pandas as pd
@@ -21,6 +22,8 @@ class AudioDataCollector:
         self.num_speakers = tk.IntVar(value=2)
         self.play_option = tk.StringVar(value="simultaneous")
         self.save_option = tk.BooleanVar(value=True)
+        self.cancel_flag = threading.Event()
+
 
         self.ask_excel_file()
         self.create_widgets()
@@ -78,9 +81,14 @@ class AudioDataCollector:
         # Buttons: Save and Play & Save
         tk.Button(self.root, text="Save Data", command=self.save_to_excel).grid(row=row, column=0, columnspan=2, pady=10, padx=5)
         tk.Button(self.root, text="Play & Save", command=self.play_and_save).grid(row=row, column=2, columnspan=2, pady=10, padx=5)
+        tk.Button(self.root, text="Cancel Playback", command=self.cancel_playback).grid(row=row, column=4, pady=10, padx=5)
+
 
         # Initial stats
         self.update_stats_label()
+        
+    def cancel_playback(self):
+        self.cancel_flag.set()
 
     def browse_folder(self):
         folder = filedialog.askdirectory()
@@ -202,17 +210,16 @@ class AudioDataCollector:
 
             with wave.open(path, 'rb') as wf:
                 pa = pyaudio.PyAudio()
-
                 stream = pa.open(
                     format=pa.get_format_from_width(wf.getsampwidth()),
                     channels=wf.getnchannels(),
                     rate=wf.getframerate(),
                     output=True,
-                    output_device_index=device_index  # ensure valid device index
+                    output_device_index=device_index
                 )
 
                 data = wf.readframes(1024)
-                while data:
+                while data and not self.cancel_flag.is_set():
                     stream.write(data)
                     data = wf.readframes(1024)
 
@@ -221,6 +228,7 @@ class AudioDataCollector:
                 pa.terminate()
         except Exception as e:
             print(f"Error playing file '{filename}' on device '{device_str}': {e}")
+
 
 
     def play_audio(self):
@@ -239,6 +247,8 @@ class AudioDataCollector:
         # 3) let the user know
         messagebox.showinfo("Playback", "Starting playback now…")
 
+        self.cancel_flag.clear()
+
         # 4) play
         if self.play_option.get() == "simultaneous":
             threads = []
@@ -253,6 +263,46 @@ class AudioDataCollector:
                 self.play_file(f, d_str)
 
         return True
+    def save_session_to_excel(self, files, devices):
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            durations = [self.get_duration(f) for f in files]
+            total_duration = max(durations) if self.play_option.get() == "simultaneous" else sum(durations)
+
+            df_new = pd.DataFrame([{ 
+                "File ID": now,
+                **{f"Speaker {i+1} File": files[i] for i in range(len(files))},
+                **{f"Speaker {i+1} Device": devices[i] for i in range(len(devices))},
+                "Playback": self.play_option.get(),
+                "Speaker Count": self.num_speakers.get(),
+                "Files Recorded": len(files),
+                "Duration Recorded": total_duration
+            }])
+
+            if os.path.exists(self.excel_path):
+                df_old = pd.read_excel(self.excel_path)
+                df_all = pd.concat([df_old, df_new], ignore_index=True)
+            else:
+                df_all = df_new
+            try:
+                with pd.ExcelWriter(self.excel_path, engine='openpyxl', mode='w') as writer:
+                    df_all.to_excel(writer, index=False)
+            except PermissionError:
+                messagebox.showerror("Save Error", "Permission denied. Please close the Excel file if it's open.")
+                return
+            self.update_stats_label()
+            messagebox.showinfo("Saved", f"Data saved to {self.excel_path}\n\n"
+                                        f"Files Recorded: {len(files)}\n"
+                                        f"Duration: {total_duration:.2f} s")
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Could not save to Excel: {e}")
+
+
+    def ask_to_save(self, files, devices):
+        def _ask():
+            if messagebox.askyesno("Save Data", "Do you want to save this playback session?"):
+                self.save_session_to_excel(files, devices)
+        self.root.after(0, _ask)
 
     def play_and_save(self):
         # 1) collect & validate
@@ -268,6 +318,9 @@ class AudioDataCollector:
         # 2) disable buttons so you can't hammer “Play & Save” again
         self.root.nametowidget(".!button2").config(state="disabled")
         self.root.nametowidget(".!button").config(state="disabled")
+        
+        self.cancel_flag.clear()
+
 
         # 3) spawn the background worker
         threading.Thread(
@@ -306,13 +359,11 @@ class AudioDataCollector:
             chunk_size = 1024
             while True:
                 datas = [wf.readframes(chunk_size) for wf in wfs]
-                # if every returned b'' → we’re done
-                if all(len(d)==0 for d in datas):
+                if all(len(d)==0 for d in datas) or self.cancel_flag.is_set():
                     break
-                # write whatever data is available into each stream
                 for data, stream in zip(datas, streams):
                     if data:
-                        stream.write(data)
+                        stream.write(data)  
 
             # 3) clean up
             for stream, pa, wf in zip(streams, pas, wfs):
@@ -324,41 +375,15 @@ class AudioDataCollector:
         # === sequential fallback (unchanged) ===
         else:
             for f, d_str in zip(files, devices):
+                if self.cancel_flag.is_set():
+                    break
+
                 self.play_file(f, d_str)
 
         # === saving ===
-        if self.save_option.get():
-            try:
-                # exactly your existing save logic:
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                durations = [self.get_duration(f) for f in files]
-                total_duration = (max(durations) if self.play_option.get()=="simultaneous"
-                                  else sum(durations))
-                df_new = pd.DataFrame([{ 
-                    "File ID": now,
-                    **{f"Speaker {i+1} File": files[i] for i in range(len(files))},
-                    **{f"Speaker {i+1} Device": devices[i] for i in range(len(devices))},
-                    "Playback": self.play_option.get(),
-                    "Speaker Count": self.num_speakers.get(),
-                    "Files Recorded": len(files),
-                    "Duration Recorded": total_duration
-                }])
-                if os.path.exists(self.excel_path):
-                    df_old = pd.read_excel(self.excel_path)
-                    df_all = pd.concat([df_old, df_new], ignore_index=True)
-                else:
-                    df_all = df_new
-                df_all.to_excel(self.excel_path, index=False)
-                # update the stats label on the main thread
-                self.root.after(0, self.update_stats_label)
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Saved",
-                    f"Data saved to {self.excel_path}\n\n"
-                    f"Files Recorded: {len(files)}\n"
-                    f"Duration: {total_duration:.2f} s"
-                ))
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Save Error", str(e)))
+     # Ask whether to save — no matter if playback was cancelled or completed
+        self.ask_to_save(files, devices)
+
 
         # 4) re-enable buttons on the main thread
         def reenable():
